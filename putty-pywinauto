@@ -1,11 +1,12 @@
-putty_exe_path="d:\\PuTTY\\putty.exe"
-pwfile="pwfile.txt"
-port=22
-
+#使用pywinauto实现调用putty并执行命令，用于日常测试
 
 from pywinauto.application import Application
 from pywinauto import findwindows
 import time
+
+putty_exe_path="d:\\PuTTY\\putty.exe"
+pwfile="pwfile.txt"
+port=22
 
 def exec_cmd_putty( ip , flag ):
     cmdline = "%s -l root -pwfile %s -P %d %s" %(putty_exe_path,pwfile,port,ip)
