@@ -1,0 +1,51 @@
+putty_exe_path="d:\\PuTTY\\putty.exe"
+pwfile="pwfile.txt"
+port=22
+
+
+from pywinauto.application import Application
+from pywinauto import findwindows
+import time
+
+def exec_cmd_putty( ip , flag ):
+    cmdline = "%s -l root -pwfile %s -P %d %s" %(putty_exe_path,pwfile,port,ip)
+    app = Application().start(cmd_line= cmdline )
+    try:
+        psa = app["PuTTY Security Alert"]
+        #psa.print_control_identifiers()
+        psa["Button2"].click() 
+    except:
+        pass
+    putty=app.PuTTY
+    putty.wait("ready",timeout=10)
+    #操作命令验证
+    cmd1= "ls -l %d" %( flag )
+    print(cmd1)
+    putty.type_keys( cmd1 ,with_spaces=True)
+    putty.type_keys("{ENTER}")
+    time.sleep(2)
+    #dns请求验证
+    cmd2 = "nslookup %d.test.com"  %( flag )
+    print(cmd2)
+    putty.type_keys( cmd2 ,with_spaces=True)
+    putty.type_keys("{ENTER}")
+    time.sleep(2)
+
+    #系统调用验证
+    cmd3 = "perl -e \"system {(}\'ls -l\'{)}\""
+    #python -c "import os;os.system('ls')"  
+    print(cmd3)
+    putty.type_keys( cmd3 ,with_spaces=True)
+    putty.type_keys("{ENTER}")
+
+    #其他按需添加
+    time.sleep(2)
+    app.kill()
+
+with open ("ipaddr.txt","r") as f:
+    iplist  = f.readlines()
+i=1
+#multiprocessing 搞成多线程
+for ip in iplist:
+    exec_cmd_putty(ip,i)
+    i = i +1
