@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include <sys/socket.h>
 #include <linux/netlink.h>
 #include <linux/connector.h>
@@ -15,14 +16,17 @@
 #include <sys/stat.h>
 #include <limits.h>
 #include <sys/epoll.h>
-#include <sys/timerfd.h>
-#include <inttypes.h>
+#include <sys/resource.h>
+#include <sched.h>
 
 #define PROC_INFO_BUF_SIZE 4096
 #define MAX_CACHE_ENTRIES 1024
 #define CACHE_TTL_SECONDS 10
-#define MAX_RETRIES 3
-#define RETRY_DELAY_MS 5
+#define MAX_RETRIES 10           // 最大重试次数增加到10次
+#define FAST_RETRY_DELAY_US 300   // 快速重试间隔300微秒
+#define PRELOAD_CACHE_SIZE 32     // 预读缓存大小
+#define MAX_EVENTS 32
+#define PROC_PATH_MAX 40
 
 struct Event {
     unsigned event_type;
@@ -38,7 +42,7 @@ struct ProcInfo {
 struct ProcessCache {
     pid_t pid;
     time_t last_update;
-    int status; // 0=exit, 1=fork, 2=exec
+    int status;
     pid_t ppid;
     pid_t tgid;
     char exe[PROC_INFO_BUF_SIZE];
@@ -46,31 +50,52 @@ struct ProcessCache {
 };
 
 static struct ProcessCache process_cache[MAX_CACHE_ENTRIES];
+static pid_t preload_cache[PRELOAD_CACHE_SIZE] = {0};
+static int preload_index = 0;
 static volatile sig_atomic_t running = 1;
+
+static void increase_priority() {
+    setpriority(PRIO_PROCESS, 0, -10);
+    struct sched_param param = {.sched_priority = 10};
+    sched_setscheduler(0, SCHED_FIFO, &param);
+}
 
 static void handle_signal(int sig) {
     running = 0;
 }
 
-static int is_safe_char(char c) {
-    return isprint((unsigned char)c) && !isspace((unsigned char)c);
+static inline int is_safe_char(char c) {
+    return (c >= 0x20 && c <= 0x7E && c != ' ');
 }
 
 static void enhanced_trim(char *str) {
-    if (!str) return;
+    if (!str || !*str) return;
     
-    char *end = str + strlen(str);
-    while (end > str && !is_safe_char(*(end-1))) end--;
-    *end = '\0';
+    char *end = str + strlen(str) - 1;
+    while (end > str && !is_safe_char(*end)) end--;
+    *(end + 1) = '\0';
 
-    char *start = str;
-    while (*start && !is_safe_char(*start)) start++;
-    memmove(str, start, end - start + 1);
+    while (*str && !is_safe_char(*str)) str++;
+    if (str != str) memmove(str, str, end - str + 1);
+}
+
+static void get_proc_path(char *buf, pid_t pid, const char *file) {
+    char *p = buf;
+    *p++ = '/'; *p++ = 'p'; *p++ = 'r'; *p++ = 'o'; *p++ = 'c'; *p++ = '/';
+    
+    char pid_str[16];
+    char *pid_end = pid_str + sprintf(pid_str, "%d", pid);
+    memcpy(p, pid_str, pid_end - pid_str);
+    p += pid_end - pid_str;
+    
+    *p++ = '/';
+    while (*file) *p++ = *file++;
+    *p = '\0';
 }
 
 static int read_proc_file(pid_t pid, const char *file, char *buf, size_t size) {
-    char path[PATH_MAX];
-    snprintf(path, sizeof(path), "/proc/%d/%s", pid, file);
+    char path[PROC_PATH_MAX];
+    get_proc_path(path, pid, file);
     
     int fd = open(path, O_RDONLY);
     if (fd == -1) return -1;
@@ -85,48 +110,62 @@ static int read_proc_file(pid_t pid, const char *file, char *buf, size_t size) {
     return -1;
 }
 
-static int get_proc_info_with_retry(pid_t pid, struct ProcInfo *info, int retries) {
+static int is_process_alive(pid_t pid) {
+    char path[PROC_PATH_MAX];
+    get_proc_path(path, pid, "status");
+    return access(path, F_OK) == 0;
+}
+
+static int get_proc_info_aggressive(pid_t pid, struct ProcInfo *info) {
     memset(info, 0, sizeof(*info));
     
-    for (int i = 0; i < retries; i++) {
-        // Get cwd
-        char path[PATH_MAX];
-        struct stat st;
-        snprintf(path, sizeof(path), "/proc/%d/cwd", pid);
-        if (lstat(path, &st) == 0 && S_ISLNK(st.st_mode)) {
-            readlink(path, info->cwd, sizeof(info->cwd)-1);
-        }
-
-        // Get exe (most important for exec events)
-        snprintf(path, sizeof(path), "/proc/%d/exe", pid);
+    char path[PROC_PATH_MAX];
+    struct stat st;
+    int retries = 0;
+    
+    // 1. 激进获取exe路径
+    get_proc_path(path, pid, "exe");
+    while (retries < MAX_RETRIES) {
         if (lstat(path, &st) == 0 && S_ISLNK(st.st_mode)) {
             ssize_t len = readlink(path, info->exe, sizeof(info->exe)-1);
             if (len > 0) {
                 info->exe[len] = '\0';
                 char *deleted = strstr(info->exe, " (deleted)");
                 if (deleted) *deleted = '\0';
+                break;
             }
         }
-
-        // Get cmdline (may be empty for very short-lived processes)
-        if (read_proc_file(pid, "cmdline", info->cmdline, sizeof(info->cmdline)) == 0) {
-            for (size_t i = 0; i < strlen(info->cmdline); i++) {
-                if (info->cmdline[i] == '\0') info->cmdline[i] = ' ';
+        
+        if (!is_process_alive(pid)) break;
+        usleep(FAST_RETRY_DELAY_US);
+        retries++;
+    }
+    
+    // 2. 并行获取其他信息
+    #pragma omp parallel sections
+    {
+        #pragma omp section
+        {
+            // 获取cwd
+            get_proc_path(path, pid, "cwd");
+            if (lstat(path, &st) == 0 && S_ISLNK(st.st_mode)) {
+                readlink(path, info->cwd, sizeof(info->cwd)-1);
             }
         }
-
-        // If we got at least the exe path, consider it successful
-        if (info->exe[0] != '\0') {
-            enhanced_trim(info->cmdline);
-            return 0;
-        }
-
-        if (i < retries - 1) {
-            struct timespec delay = {0, RETRY_DELAY_MS * 1000000};
-            nanosleep(&delay, NULL);
+        
+        #pragma omp section
+        {
+            // 获取cmdline
+            if (read_proc_file(pid, "cmdline", info->cmdline, sizeof(info->cmdline)) == 0) {
+                for (char *p = info->cmdline; *p; p++) {
+                    if (*p == '\0') *p = ' ';
+                }
+                enhanced_trim(info->cmdline);
+            }
         }
     }
-    return -1;
+    
+    return (info->exe[0] != '\0') ? 0 : -1;
 }
 
 static void get_timestamp(char *buf, size_t size) {
@@ -138,9 +177,9 @@ static void get_timestamp(char *buf, size_t size) {
 }
 
 static pid_t get_ppid_from_stat(pid_t pid) {
-    char path[PATH_MAX];
-    snprintf(path, sizeof(path), "/proc/%d/stat", pid);
-
+    char path[PROC_PATH_MAX];
+    get_proc_path(path, pid, "stat");
+    
     FILE *fp = fopen(path, "r");
     if (!fp) return -1;
 
@@ -163,7 +202,7 @@ static pid_t get_ppid_from_stat(pid_t pid) {
 }
 
 static void update_cache(pid_t pid, int status, pid_t ppid, pid_t tgid, 
-                         const char *exe, const char *cmdline) {
+                       const char *exe, const char *cmdline) {
     time_t now = time(NULL);
     int empty_slot = -1;
 
@@ -233,8 +272,7 @@ static int nl_connect() {
     int nl_sock = socket(PF_NETLINK, SOCK_DGRAM | SOCK_NONBLOCK, NETLINK_CONNECTOR);
     if (nl_sock == -1) return -1;
 
-    // Increase receive buffer size
-    int rcvbuf_size = 256 * 1024;
+    int rcvbuf_size = 2 * 1024 * 1024; // 2MB接收缓冲区
     setsockopt(nl_sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf_size, sizeof(rcvbuf_size));
 
     struct sockaddr_nl sa = {
@@ -314,6 +352,7 @@ static int handle_proc_ev(int nl_sock, struct Event *ev) {
 }
 
 int main() {
+    increase_priority();
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
 
@@ -329,7 +368,6 @@ int main() {
         return EXIT_FAILURE;
     }
 
-    // Set up epoll for non-blocking I/O
     int epoll_fd = epoll_create1(0);
     if (epoll_fd == -1) {
         perror("epoll_create1");
@@ -337,9 +375,7 @@ int main() {
         return EXIT_FAILURE;
     }
 
-    struct epoll_event ev;
-    ev.events = EPOLLIN;
-    ev.data.fd = nl_sock;
+    struct epoll_event ev = { .events = EPOLLIN, .data.fd = nl_sock };
     if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, nl_sock, &ev) == -1) {
         perror("epoll_ctl");
         close(epoll_fd);
@@ -347,64 +383,63 @@ int main() {
         return EXIT_FAILURE;
     }
 
-    printf("Process Monitor Started (Press Ctrl+C to exit)...\n");
+    printf("Ultimate Process Monitor Started (Press Ctrl+C to exit)...\n");
 
-    struct epoll_event events[1];
+    struct epoll_event events[MAX_EVENTS];
     while (running) {
-        int nfds = epoll_wait(epoll_fd, events, 1, 100); // 100ms timeout
+        int nfds = epoll_wait(epoll_fd, events, MAX_EVENTS, 100);
         if (nfds == -1) {
             if (errno == EINTR) continue;
             perror("epoll_wait");
             break;
         }
 
-        cleanup_cache();
+        for (int i = 0; i < nfds; i++) {
+            if (events[i].data.fd == nl_sock) {
+                struct Event ev;
+                while (handle_proc_ev(nl_sock, &ev) > 0) {
+                    char timestamp[32];
+                    get_timestamp(timestamp, sizeof(timestamp));
 
-        if (nfds > 0) {
-            struct Event ev;
-            while (handle_proc_ev(nl_sock, &ev) > 0) {
-                char timestamp[32];
-                get_timestamp(timestamp, sizeof(timestamp));
+                    switch (ev.event_type) {
+                    case PROC_EVENT_FORK:
+                        // 预存fork事件
+                        preload_cache[preload_index++ % PRELOAD_CACHE_SIZE] = ev.pid;
+                        update_cache(ev.pid, 1, ev.ppid, ev.tgid, NULL, NULL);
+                        break;
 
-                switch (ev.event_type) {
-                case PROC_EVENT_FORK: {
-                    struct ProcInfo parent_info, child_info;
-                    get_proc_info_with_retry(ev.ppid, &parent_info, MAX_RETRIES);
-                    get_proc_info_with_retry(ev.pid, &child_info, MAX_RETRIES);
-
-                    char traceback[256];
-                    traceback_pids(ev.pid, traceback, sizeof(traceback));
-
-                    printf("[%s] etype=fork parent=%d pcwd=\"%s\" pexe=\"%s\" pcmd=\"%s\" "
-                           "child=%d ccwd=\"%s\" cexe=\"%s\" ccmd=\"%s\" traceback=\"%s\"\n",
-                           timestamp,
-                           ev.ppid, parent_info.cwd, parent_info.exe, parent_info.cmdline,
-                           ev.pid, child_info.cwd, child_info.exe, child_info.cmdline,
-                           traceback);
-
-                    update_cache(ev.pid, 1, ev.ppid, ev.tgid, child_info.exe, child_info.cmdline);
-                    break;
-                }
-                case PROC_EVENT_EXEC: {
-                    struct ProcInfo process_info;
-                    int ret = get_proc_info_with_retry(ev.pid, &process_info, MAX_RETRIES);
-                    
-                    pid_t spid = ev.tgid;
-                    pid_t ppid = 0;
-                    struct ProcInfo parent_info;
-
-                    if (ev.pid == ev.tgid) {
-                        ppid = get_ppid_from_stat(ev.pid);
-                        if (ppid > 0) {
-                            spid = ppid;
-                            get_proc_info_with_retry(spid, &parent_info, MAX_RETRIES);
+                    case PROC_EVENT_EXEC: {
+                        // 检查是否是预存进程
+                        int is_preloaded = 0;
+                        for (int i = 0; i < PRELOAD_CACHE_SIZE; i++) {
+                            if (preload_cache[i] == ev.pid) {
+                                is_preloaded = 1;
+                                preload_cache[i] = 0;
+                                break;
+                            }
                         }
-                    }
 
-                    // Fallback to cache if we couldn't get process info
-                    if (ret != 0 || process_info.exe[0] == '\0') {
+                        struct ProcInfo process_info;
+                        int ret = get_proc_info_aggressive(ev.pid, &process_info);
+                        
+                        pid_t spid = ev.tgid;
+                        pid_t ppid = 0;
+                        struct ProcInfo parent_info = {0};
+
+                        // 获取父进程信息
+                        if (ev.pid == ev.tgid) {
+                            ppid = get_ppid_from_stat(ev.pid);
+                            if (ppid > 0) {
+                                spid = ppid;
+                                get_proc_info_aggressive(spid, &parent_info);
+                            }
+                        } else {
+                            get_proc_info_aggressive(spid, &parent_info);
+                        }
+
+                        // 从缓存补充信息
                         for (int i = 0; i < MAX_CACHE_ENTRIES; i++) {
-                            if (process_cache[i].pid == ev.pid && process_cache[i].status != 0) {
+                            if (process_cache[i].pid == ev.pid) {
                                 if (process_info.exe[0] == '\0' && process_cache[i].exe[0] != '\0') {
                                     strncpy(process_info.exe, process_cache[i].exe, sizeof(process_info.exe)-1);
                                 }
@@ -414,30 +449,27 @@ int main() {
                                 break;
                             }
                         }
+
+                        char traceback[256] = {0};
+                        traceback_pids(ev.pid, traceback, sizeof(traceback));
+
+                        printf("[%s] pid=%d exe=\"%s\" cmd=\"%s\" parent=%d pexe=\"%s\" traceback=\"%s\"\n",
+                               timestamp,
+                               ev.pid, process_info.exe, process_info.cmdline,
+                               spid, parent_info.exe, traceback);
+
+                        update_cache(ev.pid, 2, ppid, ev.tgid, process_info.exe, process_info.cmdline);
+                        break;
                     }
-
-                    char traceback[256];
-                    traceback_pids(ev.pid, traceback, sizeof(traceback));
-
-                    printf("[%s] etype=exec parent=%d pcwd=\"%s\" pexe=\"%s\" pcmd=\"%s\" "
-                           "process=%d cwd=\"%s\" exe=\"%s\" cmd=\"%s\" traceback=\"%s\"\n",
-                           timestamp,
-                           spid, parent_info.cwd, parent_info.exe, parent_info.cmdline,
-                           ev.pid, process_info.cwd, process_info.exe, process_info.cmdline,
-                           traceback);
-
-                    update_cache(ev.pid, 2, ppid, ev.tgid, process_info.exe, process_info.cmdline);
-                    break;
+                    case PROC_EVENT_EXIT:
+                        update_cache(ev.pid, 0, 0, 0, NULL, NULL);
+                        break;
+                    }
+                    fflush(stdout);
                 }
-                case PROC_EVENT_EXIT: {
-                    struct ProcInfo process_info;
-                    update_cache(ev.pid, 0, 0, 0, NULL, NULL);
-                    break;
-                }
-                }
-                fflush(stdout);
             }
         }
+        cleanup_cache();
     }
 
     set_proc_ev_listen(nl_sock, false);
