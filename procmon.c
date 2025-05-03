@@ -19,12 +19,12 @@
 #include <sys/resource.h>
 #include <sched.h>
 
-#define PROC_INFO_BUF_SIZE 4096
+#define PROC_INFO_BUF_SIZE 8192  // 增大缓冲区以适应长命令行
 #define MAX_CACHE_ENTRIES 1024
 #define CACHE_TTL_SECONDS 10
-#define MAX_RETRIES 10           // 最大重试次数增加到10次
-#define FAST_RETRY_DELAY_US 300   // 快速重试间隔300微秒
-#define PRELOAD_CACHE_SIZE 32     // 预读缓存大小
+#define MAX_RETRIES 10
+#define FAST_RETRY_DELAY_US 300
+#define PRELOAD_CACHE_SIZE 32
 #define MAX_EVENTS 32
 #define PROC_PATH_MAX 40
 
@@ -65,7 +65,7 @@ static void handle_signal(int sig) {
 }
 
 static inline int is_safe_char(char c) {
-    return (c >= 0x20 && c <= 0x7E && c != ' ');
+    return (c >= 0x20 && c <= 0x7E) || (c & 0x80);
 }
 
 static void enhanced_trim(char *str) {
@@ -80,17 +80,7 @@ static void enhanced_trim(char *str) {
 }
 
 static void get_proc_path(char *buf, pid_t pid, const char *file) {
-    char *p = buf;
-    *p++ = '/'; *p++ = 'p'; *p++ = 'r'; *p++ = 'o'; *p++ = 'c'; *p++ = '/';
-    
-    char pid_str[16];
-    char *pid_end = pid_str + sprintf(pid_str, "%d", pid);
-    memcpy(p, pid_str, pid_end - pid_str);
-    p += pid_end - pid_str;
-    
-    *p++ = '/';
-    while (*file) *p++ = *file++;
-    *p = '\0';
+    snprintf(buf, PROC_PATH_MAX, "/proc/%d/%s", pid, file);
 }
 
 static int read_proc_file(pid_t pid, const char *file, char *buf, size_t size) {
@@ -110,6 +100,34 @@ static int read_proc_file(pid_t pid, const char *file, char *buf, size_t size) {
     return -1;
 }
 
+static int read_proc_cmdline(pid_t pid, char *buf, size_t size) {
+    char path[PROC_PATH_MAX];
+    get_proc_path(path, pid, "cmdline");
+    
+    int fd = open(path, O_RDONLY);
+    if (fd == -1) return -1;
+    
+    ssize_t n = read(fd, buf, size-1);
+    close(fd);
+    
+    if (n <= 0) return -1;
+
+    buf[n] = '\0';
+    
+    for (int i = 0; i < n; i++) {
+        if (buf[i] == '\0') {
+            if (i < n-1) {
+                buf[i] = ' ';
+            } else {
+                buf[i] = '\0';
+            }
+        }
+    }
+    
+    buf[size-1] = '\0';
+    return 0;
+}
+
 static int is_process_alive(pid_t pid) {
     char path[PROC_PATH_MAX];
     get_proc_path(path, pid, "status");
@@ -123,7 +141,6 @@ static int get_proc_info_aggressive(pid_t pid, struct ProcInfo *info) {
     struct stat st;
     int retries = 0;
     
-    // 1. 激进获取exe路径
     get_proc_path(path, pid, "exe");
     while (retries < MAX_RETRIES) {
         if (lstat(path, &st) == 0 && S_ISLNK(st.st_mode)) {
@@ -141,30 +158,26 @@ static int get_proc_info_aggressive(pid_t pid, struct ProcInfo *info) {
         retries++;
     }
     
-    // 2. 并行获取其他信息
-    #pragma omp parallel sections
-    {
-        #pragma omp section
-        {
-            // 获取cwd
-            get_proc_path(path, pid, "cwd");
-            if (lstat(path, &st) == 0 && S_ISLNK(st.st_mode)) {
-                readlink(path, info->cwd, sizeof(info->cwd)-1);
+    get_proc_path(path, pid, "cwd");
+    if (lstat(path, &st) == 0 && S_ISLNK(st.st_mode)) {
+        readlink(path, info->cwd, sizeof(info->cwd)-1);
+    }
+
+    if (read_proc_cmdline(pid, info->cmdline, sizeof(info->cmdline)) != 0) {
+        get_proc_path(path, pid, "comm");
+        FILE *f = fopen(path, "r");
+        if (f) {
+            if (fgets(info->cmdline, sizeof(info->cmdline), f)) {
+                info->cmdline[strcspn(info->cmdline, "\n")] = '\0';
             }
-        }
-        
-        #pragma omp section
-        {
-            // 获取cmdline
-            if (read_proc_file(pid, "cmdline", info->cmdline, sizeof(info->cmdline)) == 0) {
-                for (char *p = info->cmdline; *p; p++) {
-                    if (*p == '\0') *p = ' ';
-                }
-                enhanced_trim(info->cmdline);
-            }
+            fclose(f);
+        } else if (info->exe[0] != '\0') {
+            const char *base = strrchr(info->exe, '/');
+            strncpy(info->cmdline, base ? base+1 : info->exe, sizeof(info->cmdline)-1);
         }
     }
     
+    enhanced_trim(info->cmdline);
     return (info->exe[0] != '\0') ? 0 : -1;
 }
 
@@ -272,7 +285,7 @@ static int nl_connect() {
     int nl_sock = socket(PF_NETLINK, SOCK_DGRAM | SOCK_NONBLOCK, NETLINK_CONNECTOR);
     if (nl_sock == -1) return -1;
 
-    int rcvbuf_size = 2 * 1024 * 1024; // 2MB接收缓冲区
+    int rcvbuf_size = 2 * 1024 * 1024;
     setsockopt(nl_sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf_size, sizeof(rcvbuf_size));
 
     struct sockaddr_nl sa = {
@@ -403,13 +416,11 @@ int main() {
 
                     switch (ev.event_type) {
                     case PROC_EVENT_FORK:
-                        // 预存fork事件
                         preload_cache[preload_index++ % PRELOAD_CACHE_SIZE] = ev.pid;
                         update_cache(ev.pid, 1, ev.ppid, ev.tgid, NULL, NULL);
                         break;
 
                     case PROC_EVENT_EXEC: {
-                        // 检查是否是预存进程
                         int is_preloaded = 0;
                         for (int i = 0; i < PRELOAD_CACHE_SIZE; i++) {
                             if (preload_cache[i] == ev.pid) {
@@ -426,7 +437,6 @@ int main() {
                         pid_t ppid = 0;
                         struct ProcInfo parent_info = {0};
 
-                        // 获取父进程信息
                         if (ev.pid == ev.tgid) {
                             ppid = get_ppid_from_stat(ev.pid);
                             if (ppid > 0) {
@@ -437,7 +447,6 @@ int main() {
                             get_proc_info_aggressive(spid, &parent_info);
                         }
 
-                        // 从缓存补充信息
                         for (int i = 0; i < MAX_CACHE_ENTRIES; i++) {
                             if (process_cache[i].pid == ev.pid) {
                                 if (process_info.exe[0] == '\0' && process_cache[i].exe[0] != '\0') {
@@ -453,10 +462,17 @@ int main() {
                         char traceback[256] = {0};
                         traceback_pids(ev.pid, traceback, sizeof(traceback));
 
-                        printf("[%s] pid=%d exe=\"%s\" cmd=\"%s\" parent=%d pexe=\"%s\" traceback=\"%s\"\n",
-                               timestamp,
-                               ev.pid, process_info.exe, process_info.cmdline,
-                               spid, parent_info.exe, traceback);
+                        printf("[%s] dpid=%d dexe=\"%s\" dcmd=\"%s\" dcwd=\"%s\" spid=%d sexe=\"%s\" scmd=\"%s\" scwd=\"%s\" traceback=\"%s\"\n",
+                            timestamp,
+                            ev.pid, 
+                            process_info.exe[0] ? process_info.exe : "?", 
+                            process_info.cmdline[0] ? process_info.cmdline : "?",
+                            process_info.cwd[0] ? process_info.cwd : "?",
+                            spid,
+                            parent_info.exe[0] ? parent_info.exe : "?",
+                            parent_info.cmdline[0] ? parent_info.cmdline : "?",
+                            parent_info.cwd[0] ? parent_info.cwd : "?",
+                            traceback);
 
                         update_cache(ev.pid, 2, ppid, ev.tgid, process_info.exe, process_info.cmdline);
                         break;
