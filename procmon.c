@@ -19,7 +19,7 @@
 #include <sys/resource.h>
 #include <sched.h>
 
-#define PROC_INFO_BUF_SIZE 8192  // 增大缓冲区以适应长命令行
+#define PROC_INFO_BUF_SIZE 4096
 #define MAX_CACHE_ENTRIES 1024
 #define CACHE_TTL_SECONDS 10
 #define MAX_RETRIES 10
@@ -45,6 +45,8 @@ struct ProcessCache {
     int status;
     pid_t ppid;
     pid_t tgid;
+    char name[256];           // 新增：进程名
+    char cwd[PROC_INFO_BUF_SIZE]; // 新增：进程工作目录
     char exe[PROC_INFO_BUF_SIZE];
     char cmdline[PROC_INFO_BUF_SIZE];
 };
@@ -82,8 +84,8 @@ static void enhanced_trim(char *str) {
 static void get_proc_path(char *buf, pid_t pid, const char *file) {
     snprintf(buf, PROC_PATH_MAX, "/proc/%d/%s", pid, file);
 }
-
-static int read_proc_file(pid_t pid, const char *file, char *buf, size_t size) {
+static int read_proc_file(pid_t pid, const char *file, char *buf, size_t s
+ize) {
     char path[PROC_PATH_MAX];
     get_proc_path(path, pid, file);
     
@@ -134,6 +136,106 @@ static int is_process_alive(pid_t pid) {
     return access(path, F_OK) == 0;
 }
 
+static const char *get_proc_name_cached(pid_t pid) {
+    static const char *unknown = "?";
+    time_t now = time(NULL);
+    
+    // 查找缓存
+    for (int i = 0; i < MAX_CACHE_ENTRIES; i++) {
+        if (process_cache[i].pid == pid) {
+            if (process_cache[i].name[0] != '\0') {
+                process_cache[i].last_update = now;
+                return process_cache[i].name;
+            }
+            break;
+        }
+    }
+    
+    // 缓存未命中，读取proc文件
+    char path[PROC_PATH_MAX];
+    get_proc_path(path, pid, "stat");
+    
+    FILE *fp = fopen(path, "r");
+    if (!fp) return unknown;
+    
+    char name[256] = {0};
+    if (fscanf(fp, "%*d (%255[^)])", name) != 1) {
+        fclose(fp);
+        return unknown;
+    }
+    fclose(fp);
+    
+    // 存入缓存
+    for (int i = 0; i < MAX_CACHE_ENTRIES; i++) {
+        if (process_cache[i].pid == pid || process_cache[i].pid == 0) {
+            if (process_cache[i].pid == 0) {
+                process_cache[i].pid = pid;
+            }
+            strncpy(process_cache[i].name, name, sizeof(process_cache[i].n
+ame)-1);
+            process_cache[i].last_update = now;
+            return process_cache[i].name;
+        }
+    }
+    
+    return unknown;
+}
+
+static void update_cache(pid_t pid, int status, pid_t ppid, pid_t tgid, 
+                       const char *name, const char *cwd, const char *exe,
+ const char *cmdline) {
+    time_t now = time(NULL);
+    int empty_slot = -1;
+
+    for (int i = 0; i < MAX_CACHE_ENTRIES; i++) {
+        if (process_cache[i].pid == pid) {
+            process_cache[i].status = status;
+            process_cache[i].last_update = now;
+            process_cache[i].ppid = ppid;
+            process_cache[i].tgid = tgid;
+            if (name) strncpy(process_cache[i].name, name, sizeof(process_
+cache[i].name)-1);
+            if (cwd) strncpy(process_cache[i].cwd, cwd, sizeof(process_cac
+he[i].cwd)-1);
+            if (exe) strncpy(process_cache[i].exe, exe, sizeof(process_cac
+he[i].exe)-1);
+            if (cmdline) strncpy(process_cache[i].cmdline, cmdline, sizeof
+(process_cache[i].cmdline)-1);
+            return;
+        }
+        if (empty_slot == -1 && process_cache[i].pid == 0) {
+            empty_slot = i;
+        }
+    }
+
+    if (empty_slot != -1) {
+        process_cache[empty_slot].pid = pid;
+        process_cache[empty_slot].status = status;
+        process_cache[empty_slot].last_update = now;
+        process_cache[empty_slot].ppid = ppid;
+        process_cache[empty_slot].tgid = tgid;
+        if (name) strncpy(process_cache[empty_slot].name, name, sizeof(pro
+cess_cache[empty_slot].name)-1);
+        if (cwd) strncpy(process_cache[empty_slot].cwd, cwd, sizeof(proces
+s_cache[empty_slot].cwd)-1);
+        if (exe) strncpy(process_cache[empty_slot].exe, exe, sizeof(proces
+s_cache[empty_slot].exe)-1);
+        if (cmdline) strncpy(process_cache[empty_slot].cmdline, cmdline, s
+izeof(process_cache[empty_slot].cmdline)-1);
+    }
+}
+
+static void cleanup_cache() {
+    time_t now = time(NULL);
+    for (int i = 0; i < MAX_CACHE_ENTRIES; i++) {
+        if (process_cache[i].pid != 0 && 
+            process_cache[i].status == 0 && 
+            (now - process_cache[i].last_update) > CACHE_TTL_SECONDS) {
+            memset(&process_cache[i], 0, sizeof(struct ProcessCache));
+        }
+    }
+}
+
 static int get_proc_info_aggressive(pid_t pid, struct ProcInfo *info) {
     memset(info, 0, sizeof(*info));
     
@@ -163,7 +265,8 @@ static int get_proc_info_aggressive(pid_t pid, struct ProcInfo *info) {
         readlink(path, info->cwd, sizeof(info->cwd)-1);
     }
 
-    if (read_proc_cmdline(pid, info->cmdline, sizeof(info->cmdline)) != 0) {
+    if (read_proc_cmdline(pid, info->cmdline, sizeof(info->cmdline)) != 0)
+ {
         get_proc_path(path, pid, "comm");
         FILE *f = fopen(path, "r");
         if (f) {
@@ -173,11 +276,20 @@ static int get_proc_info_aggressive(pid_t pid, struct ProcInfo *info) {
             fclose(f);
         } else if (info->exe[0] != '\0') {
             const char *base = strrchr(info->exe, '/');
-            strncpy(info->cmdline, base ? base+1 : info->exe, sizeof(info->cmdline)-1);
+            strncpy(info->cmdline, base ? base+1 : info->exe, sizeof(info-
+>cmdline)-1);
         }
     }
     
     enhanced_trim(info->cmdline);
+    
+    // 更新缓存中的信息
+    update_cache(pid, 0, 0, 0, 
+                get_proc_name_cached(pid), // 获取进程名
+                info->cwd, 
+                info->exe, 
+                info->cmdline);
+    
     return (info->exe[0] != '\0') ? 0 : -1;
 }
 
@@ -214,50 +326,8 @@ static pid_t get_ppid_from_stat(pid_t pid) {
     return atoi(p);
 }
 
-static void update_cache(pid_t pid, int status, pid_t ppid, pid_t tgid, 
-                       const char *exe, const char *cmdline) {
-    time_t now = time(NULL);
-    int empty_slot = -1;
-
-    for (int i = 0; i < MAX_CACHE_ENTRIES; i++) {
-        if (process_cache[i].pid == pid) {
-            process_cache[i].status = status;
-            process_cache[i].last_update = now;
-            process_cache[i].ppid = ppid;
-            process_cache[i].tgid = tgid;
-            if (exe) strncpy(process_cache[i].exe, exe, sizeof(process_cache[i].exe)-1);
-            if (cmdline) strncpy(process_cache[i].cmdline, cmdline, sizeof(process_cache[i].cmdline)-1);
-            return;
-        }
-        if (empty_slot == -1 && process_cache[i].pid == 0) {
-            empty_slot = i;
-        }
-    }
-
-    if (empty_slot != -1) {
-        process_cache[empty_slot].pid = pid;
-        process_cache[empty_slot].status = status;
-        process_cache[empty_slot].last_update = now;
-        process_cache[empty_slot].ppid = ppid;
-        process_cache[empty_slot].tgid = tgid;
-        if (exe) strncpy(process_cache[empty_slot].exe, exe, sizeof(process_cache[empty_slot].exe)-1);
-        if (cmdline) strncpy(process_cache[empty_slot].cmdline, cmdline, sizeof(process_cache[empty_slot].cmdline)-1);
-    }
-}
-
-static void cleanup_cache() {
-    time_t now = time(NULL);
-    for (int i = 0; i < MAX_CACHE_ENTRIES; i++) {
-        if (process_cache[i].pid != 0 && 
-            process_cache[i].status == 0 && 
-            (now - process_cache[i].last_update) > CACHE_TTL_SECONDS) {
-            memset(&process_cache[i], 0, sizeof(struct ProcessCache));
-        }
-    }
-}
-
 static void traceback_pids(pid_t pid, char *trace_buf, size_t buf_size) {
-    char tmp[32];
+    char tmp[128];
     pid_t current_pid = pid;
     int depth = 0;
     const int max_depth = 10;
@@ -268,7 +338,9 @@ static void traceback_pids(pid_t pid, char *trace_buf, size_t buf_size) {
         pid_t ppid = get_ppid_from_stat(current_pid);
         if (ppid <= 0) break;
         
-        snprintf(tmp, sizeof(tmp), "%d->", current_pid);
+        const char *proc_name = get_proc_name_cached(current_pid);
+        
+        snprintf(tmp, sizeof(tmp), "%d(%s)->", current_pid, proc_name);
         strncat(trace_buf, tmp, buf_size - strlen(trace_buf) - 1);
         
         current_pid = ppid;
@@ -276,17 +348,20 @@ static void traceback_pids(pid_t pid, char *trace_buf, size_t buf_size) {
     }
     
     if (depth > 0) {
-        snprintf(tmp, sizeof(tmp), "%d", current_pid);
+        const char *proc_name = get_proc_name_cached(current_pid);
+        snprintf(tmp, sizeof(tmp), "%d(%s)", current_pid, proc_name);
         strncat(trace_buf, tmp, buf_size - strlen(trace_buf) - 1);
     }
 }
 
 static int nl_connect() {
-    int nl_sock = socket(PF_NETLINK, SOCK_DGRAM | SOCK_NONBLOCK, NETLINK_CONNECTOR);
+    int nl_sock = socket(PF_NETLINK, SOCK_DGRAM | SOCK_NONBLOCK, NETLINK_C
+ONNECTOR);
     if (nl_sock == -1) return -1;
 
     int rcvbuf_size = 2 * 1024 * 1024;
-    setsockopt(nl_sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf_size, sizeof(rcvbuf_size));
+    setsockopt(nl_sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf_size, sizeof(rcvbuf
+_size));
 
     struct sockaddr_nl sa = {
         .nl_family = AF_NETLINK,
@@ -338,7 +413,6 @@ static int handle_proc_ev(int nl_sock, struct Event *ev) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
         return -1;
     }
-
     *ev = (struct Event){
         .event_type = packet.proc_ev.what,
         .pid = 0,
@@ -396,7 +470,8 @@ int main() {
         return EXIT_FAILURE;
     }
 
-    printf("Ultimate Process Monitor Started (Press Ctrl+C to exit)...\n");
+    printf("Ultimate Process Monitor Started (Press Ctrl+C to exit)...\n")
+;
 
     struct epoll_event events[MAX_EVENTS];
     while (running) {
@@ -416,8 +491,10 @@ int main() {
 
                     switch (ev.event_type) {
                     case PROC_EVENT_FORK:
-                        preload_cache[preload_index++ % PRELOAD_CACHE_SIZE] = ev.pid;
-                        update_cache(ev.pid, 1, ev.ppid, ev.tgid, NULL, NULL);
+                        preload_cache[preload_index++ % PRELOAD_CACHE_SIZE
+] = ev.pid;
+                        update_cache(ev.pid, 1, ev.ppid, ev.tgid, NULL, NU
+LL, NULL, NULL);
                         break;
 
                     case PROC_EVENT_EXEC: {
@@ -431,7 +508,8 @@ int main() {
                         }
 
                         struct ProcInfo process_info;
-                        int ret = get_proc_info_aggressive(ev.pid, &process_info);
+                        int ret = get_proc_info_aggressive(ev.pid, &proces
+s_info);
                         
                         pid_t spid = ev.tgid;
                         pid_t ppid = 0;
@@ -441,7 +519,8 @@ int main() {
                             ppid = get_ppid_from_stat(ev.pid);
                             if (ppid > 0) {
                                 spid = ppid;
-                                get_proc_info_aggressive(spid, &parent_info);
+                                get_proc_info_aggressive(spid, &parent_inf
+o);
                             }
                         } else {
                             get_proc_info_aggressive(spid, &parent_info);
@@ -449,36 +528,50 @@ int main() {
 
                         for (int i = 0; i < MAX_CACHE_ENTRIES; i++) {
                             if (process_cache[i].pid == ev.pid) {
-                                if (process_info.exe[0] == '\0' && process_cache[i].exe[0] != '\0') {
-                                    strncpy(process_info.exe, process_cache[i].exe, sizeof(process_info.exe)-1);
+                                if (process_info.exe[0] == '\0' && process
+_cache[i].exe[0] != '\0') {
+                                    strncpy(process_info.exe, process_cach
+e[i].exe, sizeof(process_info.exe)-1);
                                 }
-                                if (process_info.cmdline[0] == '\0' && process_cache[i].cmdline[0] != '\0') {
-                                    strncpy(process_info.cmdline, process_cache[i].cmdline, sizeof(process_info.cmdline)-1);
+                                if (process_info.cmdline[0] == '\0' && pro
+cess_cache[i].cmdline[0] != '\0') {
+                                    strncpy(process_info.cmdline, process_
+cache[i].cmdline, sizeof(process_info.cmdline)-1);
                                 }
                                 break;
                             }
                         }
 
                         char traceback[256] = {0};
-                        traceback_pids(ev.pid, traceback, sizeof(traceback));
+                        traceback_pids(ev.pid, traceback, sizeof(traceback
+));
 
-                        printf("[%s] dpid=%d dexe=\"%s\" dcmd=\"%s\" dcwd=\"%s\" spid=%d sexe=\"%s\" scmd=\"%s\" scwd=\"%s\" traceback=\"%s\"\n",
+                        printf("[%s] spid=%d sexe=%s scmd=%s scwd=%s dpid=
+%d dexe=%s dcmd=%s dcwd=%s traceback=%s\n",
                             timestamp,
-                            ev.pid, 
-                            process_info.exe[0] ? process_info.exe : "?", 
-                            process_info.cmdline[0] ? process_info.cmdline : "?",
-                            process_info.cwd[0] ? process_info.cwd : "?",
                             spid,
                             parent_info.exe[0] ? parent_info.exe : "?",
-                            parent_info.cmdline[0] ? parent_info.cmdline : "?",
+                            parent_info.cmdline[0] ? parent_info.cmdline :
+ "?",
                             parent_info.cwd[0] ? parent_info.cwd : "?",
+
+                            ev.pid, 
+                            process_info.exe[0] ? process_info.exe : "?", 
+                            process_info.cmdline[0] ? process_info.cmdline
+ : "?",
+                            process_info.cwd[0] ? process_info.cwd : "?",
                             traceback);
 
-                        update_cache(ev.pid, 2, ppid, ev.tgid, process_info.exe, process_info.cmdline);
+                        update_cache(ev.pid, 2, ppid, ev.tgid, 
+                                    get_proc_name_cached(ev.pid),
+                                    process_info.cwd,
+                                    process_info.exe, 
+                                    process_info.cmdline);
                         break;
                     }
                     case PROC_EVENT_EXIT:
-                        update_cache(ev.pid, 0, 0, 0, NULL, NULL);
+                        update_cache(ev.pid, 0, 0, 0, NULL, NULL, NULL, NU
+LL);
                         break;
                     }
                     fflush(stdout);
