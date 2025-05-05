@@ -84,8 +84,8 @@ static void enhanced_trim(char *str) {
 static void get_proc_path(char *buf, pid_t pid, const char *file) {
     snprintf(buf, PROC_PATH_MAX, "/proc/%d/%s", pid, file);
 }
-static int read_proc_file(pid_t pid, const char *file, char *buf, size_t s
-ize) {
+
+static int read_proc_file(pid_t pid, const char *file, char *buf, size_t size) {
     char path[PROC_PATH_MAX];
     get_proc_path(path, pid, file);
     
@@ -171,8 +171,7 @@ static const char *get_proc_name_cached(pid_t pid) {
             if (process_cache[i].pid == 0) {
                 process_cache[i].pid = pid;
             }
-            strncpy(process_cache[i].name, name, sizeof(process_cache[i].n
-ame)-1);
+            strncpy(process_cache[i].name, name, sizeof(process_cache[i].name)-1);
             process_cache[i].last_update = now;
             return process_cache[i].name;
         }
@@ -182,8 +181,7 @@ ame)-1);
 }
 
 static void update_cache(pid_t pid, int status, pid_t ppid, pid_t tgid, 
-                       const char *name, const char *cwd, const char *exe,
- const char *cmdline) {
+                       const char *name, const char *cwd, const char *exe, const char *cmdline) {
     time_t now = time(NULL);
     int empty_slot = -1;
 
@@ -193,14 +191,10 @@ static void update_cache(pid_t pid, int status, pid_t ppid, pid_t tgid,
             process_cache[i].last_update = now;
             process_cache[i].ppid = ppid;
             process_cache[i].tgid = tgid;
-            if (name) strncpy(process_cache[i].name, name, sizeof(process_
-cache[i].name)-1);
-            if (cwd) strncpy(process_cache[i].cwd, cwd, sizeof(process_cac
-he[i].cwd)-1);
-            if (exe) strncpy(process_cache[i].exe, exe, sizeof(process_cac
-he[i].exe)-1);
-            if (cmdline) strncpy(process_cache[i].cmdline, cmdline, sizeof
-(process_cache[i].cmdline)-1);
+            if (name) strncpy(process_cache[i].name, name, sizeof(process_cache[i].name)-1);
+            if (cwd) strncpy(process_cache[i].cwd, cwd, sizeof(process_cache[i].cwd)-1);
+            if (exe) strncpy(process_cache[i].exe, exe, sizeof(process_cache[i].exe)-1);
+            if (cmdline) strncpy(process_cache[i].cmdline, cmdline, sizeof(process_cache[i].cmdline)-1);
             return;
         }
         if (empty_slot == -1 && process_cache[i].pid == 0) {
@@ -214,14 +208,10 @@ he[i].exe)-1);
         process_cache[empty_slot].last_update = now;
         process_cache[empty_slot].ppid = ppid;
         process_cache[empty_slot].tgid = tgid;
-        if (name) strncpy(process_cache[empty_slot].name, name, sizeof(pro
-cess_cache[empty_slot].name)-1);
-        if (cwd) strncpy(process_cache[empty_slot].cwd, cwd, sizeof(proces
-s_cache[empty_slot].cwd)-1);
-        if (exe) strncpy(process_cache[empty_slot].exe, exe, sizeof(proces
-s_cache[empty_slot].exe)-1);
-        if (cmdline) strncpy(process_cache[empty_slot].cmdline, cmdline, s
-izeof(process_cache[empty_slot].cmdline)-1);
+        if (name) strncpy(process_cache[empty_slot].name, name, sizeof(process_cache[empty_slot].name)-1);
+        if (cwd) strncpy(process_cache[empty_slot].cwd, cwd, sizeof(process_cache[empty_slot].cwd)-1);
+        if (exe) strncpy(process_cache[empty_slot].exe, exe, sizeof(process_cache[empty_slot].exe)-1);
+        if (cmdline) strncpy(process_cache[empty_slot].cmdline, cmdline, sizeof(process_cache[empty_slot].cmdline)-1);
     }
 }
 
@@ -265,8 +255,7 @@ static int get_proc_info_aggressive(pid_t pid, struct ProcInfo *info) {
         readlink(path, info->cwd, sizeof(info->cwd)-1);
     }
 
-    if (read_proc_cmdline(pid, info->cmdline, sizeof(info->cmdline)) != 0)
- {
+    if (read_proc_cmdline(pid, info->cmdline, sizeof(info->cmdline)) != 0) {
         get_proc_path(path, pid, "comm");
         FILE *f = fopen(path, "r");
         if (f) {
@@ -276,8 +265,7 @@ static int get_proc_info_aggressive(pid_t pid, struct ProcInfo *info) {
             fclose(f);
         } else if (info->exe[0] != '\0') {
             const char *base = strrchr(info->exe, '/');
-            strncpy(info->cmdline, base ? base+1 : info->exe, sizeof(info-
->cmdline)-1);
+            strncpy(info->cmdline, base ? base+1 : info->exe, sizeof(info->cmdline)-1);
         }
     }
     
@@ -355,13 +343,11 @@ static void traceback_pids(pid_t pid, char *trace_buf, size_t buf_size) {
 }
 
 static int nl_connect() {
-    int nl_sock = socket(PF_NETLINK, SOCK_DGRAM | SOCK_NONBLOCK, NETLINK_C
-ONNECTOR);
+    int nl_sock = socket(PF_NETLINK, SOCK_DGRAM | SOCK_NONBLOCK, NETLINK_CONNECTOR);
     if (nl_sock == -1) return -1;
 
     int rcvbuf_size = 2 * 1024 * 1024;
-    setsockopt(nl_sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf_size, sizeof(rcvbuf
-_size));
+    setsockopt(nl_sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf_size, sizeof(rcvbuf_size));
 
     struct sockaddr_nl sa = {
         .nl_family = AF_NETLINK,
@@ -470,8 +456,7 @@ int main() {
         return EXIT_FAILURE;
     }
 
-    printf("Ultimate Process Monitor Started (Press Ctrl+C to exit)...\n")
-;
+    printf("Ultimate Process Monitor Started (Press Ctrl+C to exit)...\n");
 
     struct epoll_event events[MAX_EVENTS];
     while (running) {
@@ -491,10 +476,8 @@ int main() {
 
                     switch (ev.event_type) {
                     case PROC_EVENT_FORK:
-                        preload_cache[preload_index++ % PRELOAD_CACHE_SIZE
-] = ev.pid;
-                        update_cache(ev.pid, 1, ev.ppid, ev.tgid, NULL, NU
-LL, NULL, NULL);
+                        preload_cache[preload_index++ % PRELOAD_CACHE_SIZE] = ev.pid;
+                        update_cache(ev.pid, 1, ev.ppid, ev.tgid, NULL, NULL, NULL, NULL);
                         break;
 
                     case PROC_EVENT_EXEC: {
@@ -508,8 +491,7 @@ LL, NULL, NULL);
                         }
 
                         struct ProcInfo process_info;
-                        int ret = get_proc_info_aggressive(ev.pid, &proces
-s_info);
+                        int ret = get_proc_info_aggressive(ev.pid, &process_info);
                         
                         pid_t spid = ev.tgid;
                         pid_t ppid = 0;
@@ -519,8 +501,7 @@ s_info);
                             ppid = get_ppid_from_stat(ev.pid);
                             if (ppid > 0) {
                                 spid = ppid;
-                                get_proc_info_aggressive(spid, &parent_inf
-o);
+                                get_proc_info_aggressive(spid, &parent_info);
                             }
                         } else {
                             get_proc_info_aggressive(spid, &parent_info);
@@ -528,37 +509,29 @@ o);
 
                         for (int i = 0; i < MAX_CACHE_ENTRIES; i++) {
                             if (process_cache[i].pid == ev.pid) {
-                                if (process_info.exe[0] == '\0' && process
-_cache[i].exe[0] != '\0') {
-                                    strncpy(process_info.exe, process_cach
-e[i].exe, sizeof(process_info.exe)-1);
+                                if (process_info.exe[0] == '\0' && process_cache[i].exe[0] != '\0') {
+                                    strncpy(process_info.exe, process_cache[i].exe, sizeof(process_info.exe)-1);
                                 }
-                                if (process_info.cmdline[0] == '\0' && pro
-cess_cache[i].cmdline[0] != '\0') {
-                                    strncpy(process_info.cmdline, process_
-cache[i].cmdline, sizeof(process_info.cmdline)-1);
+                                if (process_info.cmdline[0] == '\0' && process_cache[i].cmdline[0] != '\0') {
+                                    strncpy(process_info.cmdline, process_cache[i].cmdline, sizeof(process_info.cmdline)-1);
                                 }
                                 break;
                             }
                         }
 
                         char traceback[256] = {0};
-                        traceback_pids(ev.pid, traceback, sizeof(traceback
-));
+                        traceback_pids(ev.pid, traceback, sizeof(traceback));
 
-                        printf("[%s] spid=%d sexe=%s scmd=%s scwd=%s dpid=
-%d dexe=%s dcmd=%s dcwd=%s traceback=%s\n",
+                        printf("[%s] spid=%d sexe=%s scmd=%s scwd=%s dpid=%d dexe=%s dcmd=%s dcwd=%s traceback=%s\n",
                             timestamp,
                             spid,
                             parent_info.exe[0] ? parent_info.exe : "?",
-                            parent_info.cmdline[0] ? parent_info.cmdline :
- "?",
+                            parent_info.cmdline[0] ? parent_info.cmdline : "?",
                             parent_info.cwd[0] ? parent_info.cwd : "?",
 
                             ev.pid, 
                             process_info.exe[0] ? process_info.exe : "?", 
-                            process_info.cmdline[0] ? process_info.cmdline
- : "?",
+                            process_info.cmdline[0] ? process_info.cmdline : "?",
                             process_info.cwd[0] ? process_info.cwd : "?",
                             traceback);
 
@@ -570,8 +543,7 @@ cache[i].cmdline, sizeof(process_info.cmdline)-1);
                         break;
                     }
                     case PROC_EVENT_EXIT:
-                        update_cache(ev.pid, 0, 0, 0, NULL, NULL, NULL, NU
-LL);
+                        update_cache(ev.pid, 0, 0, 0, NULL, NULL, NULL, NULL);
                         break;
                     }
                     fflush(stdout);
