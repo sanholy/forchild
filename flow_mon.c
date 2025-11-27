@@ -1,4 +1,4 @@
-﻿#include <stdio.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -48,6 +48,38 @@
 #include <linux/sock_diag.h>
 #endif
 
+// 安全的字符串拷贝函数（类似strlcpy）
+static size_t safe_strcpy(char *dst, const char *src, size_t dst_size) {
+    if (dst_size == 0) return 0;
+    
+    const char *src_start = src;
+    while (--dst_size > 0 && *src != '\0') {
+        *dst++ = *src++;
+    }
+    *dst = '\0';
+    
+    return (size_t)(src - src_start);
+}
+
+// 安全的字符串连接函数（类似strlcat）
+static size_t safe_strcat(char *dst, const char *src, size_t dst_size) {
+    if (dst_size == 0) return 0;
+    
+    size_t dst_len = strlen(dst);
+    if (dst_len >= dst_size - 1) return dst_len;
+    
+    const char *src_start = src;
+    size_t remaining = dst_size - dst_len - 1;
+    
+    while (remaining > 0 && *src != '\0') {
+        dst[dst_len++] = *src++;
+        remaining--;
+    }
+    dst[dst_len] = '\0';
+    
+    return dst_len + (size_t)(src - src_start);
+}
+
 // 蜜罐端口列表
 static uint16_t honeypot_ports[] = {
     21,    // FTP
@@ -92,7 +124,7 @@ typedef struct conn_info {
 
 // 去重缓存条目
 typedef struct dedup_cache {
-    char key[256];
+    char key[1024];
     time_t last_seen;
     struct dedup_cache *next;
 } dedup_cache_t;
@@ -230,6 +262,7 @@ static int get_process_name(pid_t pid, char *buf, size_t buf_size) {
         return -1;
     }
     
+    // 使用fgets确保不溢出
     if (fgets(buf, buf_size, fp) == NULL) {
         fclose(fp);
         return -1;
@@ -237,11 +270,14 @@ static int get_process_name(pid_t pid, char *buf, size_t buf_size) {
     
     fclose(fp);
     
+    // 安全地处理换行符
     size_t len = strlen(buf);
     if (len > 0 && buf[len-1] == '\n') {
         buf[len-1] = '\0';
     }
     
+    // 确保字符串终止
+    buf[buf_size - 1] = '\0';
     return 0;
 }
 
@@ -293,6 +329,8 @@ static int get_process_cmdline(pid_t pid, char *buf, size_t buf_size) {
         *end-- = '\0';
     }
     
+    // 确保字符串终止
+    buf[buf_size - 1] = '\0';
     return 0;
 }
 
@@ -307,9 +345,9 @@ static void learn_listen_port_from_established(conn_info_t *conn, pid_t pid,
             if (current->ip == conn->dst_ip && current->port == conn->dst_port) {
                 // 更新现有记录
                 current->pid = pid;
-                strncpy(current->proc_name, proc_name, 31);
-                strncpy(current->cmdline, cmdline, MAX_CMDLINE_LEN-1);
-                strncpy(current->filepath, filepath, MAX_FILEPATH_LEN-1);
+                safe_strcpy(current->proc_name, proc_name, sizeof(current->proc_name));
+                safe_strcpy(current->cmdline, cmdline, sizeof(current->cmdline));
+                safe_strcpy(current->filepath, filepath, sizeof(current->filepath));
                 current->last_seen = time(NULL);
                 return;
             }
@@ -323,9 +361,12 @@ static void learn_listen_port_from_established(conn_info_t *conn, pid_t pid,
         new_entry->ip = conn->dst_ip;
         new_entry->port = conn->dst_port;
         new_entry->pid = pid;
-        strncpy(new_entry->proc_name, proc_name, 31);
-        strncpy(new_entry->cmdline, cmdline, MAX_CMDLINE_LEN-1);
-        strncpy(new_entry->filepath, filepath, MAX_FILEPATH_LEN-1);
+        
+        // 使用安全的字符串拷贝
+        safe_strcpy(new_entry->proc_name, proc_name, sizeof(new_entry->proc_name));
+        safe_strcpy(new_entry->cmdline, cmdline, sizeof(new_entry->cmdline));
+        safe_strcpy(new_entry->filepath, filepath, sizeof(new_entry->filepath));
+        
         new_entry->last_seen = time(NULL);
         new_entry->next = listen_cache_head;
         listen_cache_head = new_entry;
@@ -393,7 +434,7 @@ static void remove_from_scan_cache(uint32_t src_ip, uint32_t dst_ip,
 // 通过inet_diag查询连接对应的PID - 仅CentOS 7+
 static int query_pid_by_inet_diag(uint8_t proto, uint32_t src_ip, uint16_t src_port, 
                                  uint32_t dst_ip, uint16_t dst_port, pid_t *pid) {
-    int fd, ret;
+    int fd = -1, ret = -1;
     struct sockaddr_nl nladdr;
     struct msghdr msg;
     struct iovec iov;
@@ -408,7 +449,7 @@ static int query_pid_by_inet_diag(uint8_t proto, uint32_t src_ip, uint16_t src_p
     nladdr.nl_family = AF_NETLINK;
     
     if (bind(fd, (struct sockaddr*)&nladdr, sizeof(nladdr)) < 0) {
-        close(fd);
+        close(fd);  // 修复：bind失败时关闭fd
         return -1;
     }
     
@@ -483,7 +524,7 @@ static int query_pid_by_inet_diag(uint8_t proto, uint32_t src_ip, uint16_t src_p
 
 // 通过/proc查找inode对应的PID - 仅CentOS 7+
 static pid_t find_pid_by_inode(uint32_t inode) {
-    DIR *proc_dir, *fd_dir;
+    DIR *proc_dir = NULL, *fd_dir = NULL;
     struct dirent *proc_entry, *fd_entry;
     char fd_path[512], link_path[512], link_buf[512];
     pid_t pid = -1;
@@ -526,10 +567,13 @@ static pid_t find_pid_by_inode(uint32_t inode) {
         }
         
         closedir(fd_dir);
+        fd_dir = NULL;
         if (pid != -1) break;
     }
     
-    closedir(proc_dir);
+    if (proc_dir != NULL) {
+        closedir(proc_dir);
+    }
     return pid;
 }
 #endif
@@ -564,9 +608,9 @@ static int get_cached_pid(uint8_t proto, uint32_t src_ip, uint32_t dst_ip,
             current->direction == direction) {
             
             *pid = current->pid;
-            strncpy(proc_name, current->proc_name, 31);
-            strncpy(cmdline, current->cmdline, MAX_CMDLINE_LEN-1);
-            strncpy(filepath, current->filepath, MAX_FILEPATH_LEN-1);
+            safe_strcpy(proc_name, current->proc_name, 32);
+            safe_strcpy(cmdline, current->cmdline, MAX_CMDLINE_LEN);
+            safe_strcpy(filepath, current->filepath, MAX_FILEPATH_LEN);
             current->last_seen = now;
             return 0;
         }
@@ -616,14 +660,18 @@ static void add_pid_cache(uint8_t proto, uint32_t src_ip, uint32_t dst_ip,
     new_entry->dst_port = dst_port;
     new_entry->direction = direction;
     new_entry->pid = pid;
-    strncpy(new_entry->proc_name, proc_name, 31);
-    strncpy(new_entry->cmdline, cmdline, MAX_CMDLINE_LEN-1);
-    strncpy(new_entry->filepath, filepath, MAX_FILEPATH_LEN-1);
+    
+    // 使用安全的字符串拷贝
+    safe_strcpy(new_entry->proc_name, proc_name, sizeof(new_entry->proc_name));
+    safe_strcpy(new_entry->cmdline, cmdline, sizeof(new_entry->cmdline));
+    safe_strcpy(new_entry->filepath, filepath, sizeof(new_entry->filepath));
+    
     new_entry->last_seen = now;
     new_entry->next = pid_cache_head;
     pid_cache_head = new_entry;
     pid_cache_size++;
 }
+
 
 // 查询连接对应的PID和进程信息
 static int query_connection_pid(uint8_t proto, uint32_t src_ip, uint16_t src_port,
@@ -639,17 +687,34 @@ static int query_connection_pid(uint8_t proto, uint32_t src_ip, uint16_t src_por
     }
     
     uint32_t inode = 0;
+    int ret = -1;
     
-    if (direction == 1) { // INBOUND
-        if (query_pid_by_inet_diag(proto, dst_ip, dst_port, 0, 0, (pid_t*)&inode) == 0 ||
-            query_pid_by_inet_diag(proto, dst_ip, dst_port, src_ip, src_port, (pid_t*)&inode) == 0) {
-            // 成功获取 inode
+    // 对于UDP连接，尝试多种查询方式
+    if (proto == IPPROTO_UDP) {
+        // 方式1: 查询本地socket
+        if (direction == 0) { // OUTBOUND
+            ret = query_pid_by_inet_diag(proto, src_ip, src_port, dst_ip, dst_port, (pid_t*)&inode);
+        } else { // INBOUND  
+            ret = query_pid_by_inet_diag(proto, dst_ip, dst_port, src_ip, src_port, (pid_t*)&inode);
         }
-    } else { // OUTBOUND
-        query_pid_by_inet_diag(proto, src_ip, src_port, dst_ip, dst_port, (pid_t*)&inode);
+        
+        // 方式2: 如果第一种方式失败，尝试查询监听状态的UDP socket
+        if (ret != 0) {
+            ret = query_pid_by_inet_diag(proto, src_ip, src_port, 0, 0, (pid_t*)&inode);
+        }
+    } else {
+        // TCP连接保持原有逻辑
+        if (direction == 1) { // INBOUND
+            if (query_pid_by_inet_diag(proto, dst_ip, dst_port, 0, 0, (pid_t*)&inode) == 0 ||
+                query_pid_by_inet_diag(proto, dst_ip, dst_port, src_ip, src_port, (pid_t*)&inode) == 0) {
+                ret = 0;
+            }
+        } else { // OUTBOUND
+            ret = query_pid_by_inet_diag(proto, src_ip, src_port, dst_ip, dst_port, (pid_t*)&inode);
+        }
     }
     
-    if (inode != 0) {
+    if (ret == 0 && inode != 0) {
         *pid = find_pid_by_inode(inode);
         if (*pid != -1) {
             if (get_process_name(*pid, proc_name, 32) == 0) {
@@ -664,42 +729,52 @@ static int query_connection_pid(uint8_t proto, uint32_t src_ip, uint16_t src_por
     
     // 查询失败，返回默认值
     *pid = -1;
-    strcpy(proc_name, "unknown");
-    strcpy(cmdline, "unknown");
-    strcpy(filepath, "unknown");
+    safe_strcpy(proc_name, "unknown", 32);
+    safe_strcpy(cmdline, "unknown", MAX_CMDLINE_LEN);
+    safe_strcpy(filepath, "unknown", MAX_FILEPATH_LEN);
     return -1;
     
 #else
     // SUSE 11 SP2: 直接返回 unknown
     *pid = -1;
-    strcpy(proc_name, "unknown");
-    strcpy(cmdline, "unknown");
-    strcpy(filepath, "unknown");
+    safe_strcpy(proc_name, "unknown", 32);
+    safe_strcpy(cmdline, "unknown", MAX_CMDLINE_LEN);
+    safe_strcpy(filepath, "unknown", MAX_FILEPATH_LEN);
     return -1;
 #endif
 }
 
-// 检查去重缓存 - 所有情况都基于目标IP和端口去重
+
+// 检查去重缓存 - 基于目标IP、端口和文件路径去重
 static int is_duplicate(uint8_t proto, uint8_t direction, uint32_t src_ip, 
-                       uint32_t dst_ip, uint16_t src_port, uint16_t dst_port, pid_t pid) {
+                       uint32_t dst_ip, uint16_t src_port, uint16_t dst_port, 
+                       pid_t pid, const char *filepath) {
     time_t now = time(NULL);
     dedup_cache_t *current = dedup_cache_head;
     dedup_cache_t *prev = NULL;
     
-    char key[64];
+    char key[512];
     
-    // 简化：所有连接都基于目标IP和端口去重（源端口都是随机的）
-    if (proto == IPPROTO_TCP && pid != -1) {
-        // TCP ESTABLISHED: 包含PID信息
-        snprintf(key, sizeof(key), "tcp_%d_%u_%d_%d", 
-                 direction, dst_ip, dst_port, pid);
+    // 构建去重key：协议_方向_目标IP_目标端口_文件路径
+    if (proto == IPPROTO_TCP && pid != -1 && strcmp(filepath, "unknown") != 0) {
+        // TCP ESTABLISHED且有文件路径：包含文件路径信息
+        snprintf(key, sizeof(key), "tcp_%d_%u_%d_%s", 
+                 direction, dst_ip, dst_port, filepath);
+    } else if (proto == IPPROTO_UDP && strcmp(filepath, "unknown") != 0) {
+        // UDP且有文件路径：包含文件路径信息
+        snprintf(key, sizeof(key), "udp_%d_%u_%d_%s", 
+                 direction, dst_ip, dst_port, filepath);
     } else {
-        // UDP和其他TCP状态: 基于目标IP和端口
+        // 其他情况：基于目标IP和端口（兼容原有逻辑）
         snprintf(key, sizeof(key), "%s_%d_%u_%d", 
                  (proto == IPPROTO_TCP) ? "tcp" : "udp", 
                  direction, dst_ip, dst_port);
     }
     
+    // 确保key以null终止
+    key[sizeof(key) - 1] = '\0';
+    
+    // 清理过期缓存
     while (current != NULL) {
         if (now - current->last_seen > CACHE_TIMEOUT) {
             dedup_cache_t *to_free = current;
@@ -723,10 +798,11 @@ static int is_duplicate(uint8_t proto, uint8_t direction, uint32_t src_ip,
         current = current->next;
     }
     
+    // 添加新条目
     dedup_cache_t *new_entry = malloc(sizeof(dedup_cache_t));
     if (new_entry == NULL) return 0;
     
-    strncpy(new_entry->key, key, sizeof(new_entry->key)-1);
+    safe_strcpy(new_entry->key, key, sizeof(new_entry->key));
     new_entry->last_seen = now;
     new_entry->next = dedup_cache_head;
     dedup_cache_head = new_entry;
@@ -999,14 +1075,16 @@ static void* query_thread_func(void *arg) {
         char proc_name[32] = "unknown";
         char cmdline[MAX_CMDLINE_LEN] = "unknown";
         char filepath[MAX_FILEPATH_LEN] = "unknown";
-        
-        if (conn->tcp_state == TCP_CONNTRACK_ESTABLISHED) {
+
+        // 为TCP ESTABLISHED和所有UDP连接查询PID
+        if ((conn->proto == IPPROTO_TCP && conn->tcp_state == TCP_CONNTRACK_ESTABLISHED) || 
+            conn->proto == IPPROTO_UDP) {
             query_connection_pid(conn->proto, conn->src_ip, conn->src_port,
                                conn->dst_ip, conn->dst_port, conn->direction,
                                &pid, proc_name, cmdline, filepath);
             
-            // 从INBOUND ESTABLISHED连接学习监听端口信息
-            if (conn->direction == 1) { // INBOUND
+            // 从INBOUND ESTABLISHED连接学习监听端口信息（仅TCP）
+            if (conn->direction == 1 && conn->proto == IPPROTO_TCP) {
                 learn_listen_port_from_established(conn, pid, proc_name, cmdline, filepath);
             }
         }
@@ -1015,7 +1093,7 @@ static void* query_thread_func(void *arg) {
         if ((conn->proto == IPPROTO_TCP && conn->tcp_state == TCP_CONNTRACK_ESTABLISHED) || 
             conn->proto == IPPROTO_UDP) {
             if (is_duplicate(conn->proto, conn->direction, conn->src_ip, 
-                            conn->dst_ip, conn->src_port, conn->dst_port, pid)) {
+                            conn->dst_ip, conn->src_port, conn->dst_port, pid,filepath)) {
                 // 如果是重复的连接，跳过输出
                 free(conn);
                 continue;
@@ -1059,12 +1137,18 @@ static void* query_thread_func(void *arg) {
                    cat_str, detailed_proto, device_direction,
                    src_str, dst_str, conn->dst_port);
             
-            if (conn->tcp_state == TCP_CONNTRACK_ESTABLISHED) {
-                printf(" spid=%d sproc=%s filePath=%s scmd=%s cs1=ESTABLISHED start=%s\n",
-                       pid, proc_name, filepath, cmdline, time_str);
-            } else {
-                printf(" start=%s\n", time_str);
+            // 对于TCP ESTABLISHED和UDP连接，输出进程信息
+            if ((conn->proto == IPPROTO_TCP && conn->tcp_state == TCP_CONNTRACK_ESTABLISHED) || 
+                conn->proto == IPPROTO_UDP) {
+                printf(" spid=%d sproc=%s filePath=%s scmd=%s",
+                       pid, proc_name, filepath, cmdline);
+                
+                if (conn->proto == IPPROTO_TCP) {
+                    printf(" cs1=ESTABLISHED");
+                }
             }
+            
+            printf(" start=%s\n", time_str);
             
             fflush(stdout);
         }
